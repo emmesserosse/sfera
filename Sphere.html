@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Sfera di polvere</title>
+<style>
+  /* Sfondo scuro e canvas centrato nella pagina. */
+  html, body { margin: 0; padding: 0; height: 100%; background: #1C1C1D; }
+  body { display: flex; align-items: center; justify-content: center; min-height: 100vh; overflow: hidden; }
+  canvas { display: block; width: 375px; height: 535px; max-width: 100vw; max-height: 100vh; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="sfera" width="375" height="535"></canvas>
+<script>
+(function () {
+  'use strict';
+  // --- Costanti principali ---
+  var LARGHEZZA = 375, ALTEZZA = 535;
+  var RAGGIO = 155;
+  var NUM_PARTICELLE = 5500;
+  var VELOCITA_ROT = 0.14;
+  var VELOCITA_FLUSSO = 1.0;
+  var RAGGIO_DISTURBO = 90;
+  var SFONDO = '#1C1C1D';
+  var COLORI = [[255, 255, 255], [149, 149, 149], [160, 160, 160], [185, 183, 175]];
+  var COLORE_BAGLIORE = [94, 94, 94];
+  var INTENSITA_HOLD = 0.70;
+
+  // Matrice di Bayer 8x8 per il dithering ordinato (identica a quella del gizmo).
+  var BAYER8 = [
+    [0, 32, 8, 40, 2, 34, 10, 42],
+    [48, 16, 56, 24, 50, 18, 58, 26],
+    [12, 44, 4, 36, 14, 46, 6, 38],
+    [60, 28, 52, 20, 62, 30, 54, 22],
+    [3, 35, 11, 43, 1, 33, 9, 41],
+    [51, 19, 59, 27, 49, 17, 57, 25],
+    [15, 47, 7, 39, 13, 45, 5, 37],
+    [63, 31, 55, 23, 61, 29, 53, 21]
+  ];
+
+  var canvas = document.getElementById('sfera');
+  var ctx = canvas.getContext('2d');
+  // Superficie di disegno a risoluzione nativa, su cui si applica il dithering.
+  var scena = document.createElement('canvas');
+  scena.width = LARGHEZZA; scena.height = ALTEZZA;
+  var sctx = scena.getContext('2d');
+  var appoggio = document.createElement('canvas');
+  appoggio.width = LARGHEZZA; appoggio.height = ALTEZZA;
+  var actx = appoggio.getContext('2d');
+
+  // --- Creazione delle particelle ---
+  // Distribuzione uniforme sulla sfera: z uniforme in [-1, 1], angolo uniforme.
+  function direzioneUniforme() {
+    var z = Math.random() * 2 - 1;
+    var angolo = Math.random() * Math.PI * 2;
+    var r = Math.sqrt(Math.max(0, 1 - z * z));
+    return [r * Math.cos(angolo), r * Math.sin(angolo), z];
+  }
+  var particelle = [];
+  for (var i = 0; i < NUM_PARTICELLE; i++) {
+    var dir = direzioneUniforme();
+    var cr = Math.random();
+    var colore = 0;
+    if (cr < 0.38) { colore = 0; }
+    else if (cr < 0.66) { colore = 1; }
+    else if (cr < 0.88) { colore = 2; }
+    else { colore = 3; }
+    particelle.push({
+      base: dir,
+      fase: Math.random() * Math.PI * 2,
+      velPulso: 0.35 + Math.random() * 0.55,
+      ampRadiale: 1.5 + Math.random() * 5.5,
+      dim: 0.6 + Math.random() * 1.0,
+      colore: colore,
+      faseFlusso: Math.random() * Math.PI * 2,
+      spost: 0, velSpost: 0, bagliore: 0
+    });
+  }
+
+  var cx = LARGHEZZA / 2, cy = ALTEZZA * 0.46;
+  // Luce direzionale normalizzata dall'alto a sinistra.
+  var luce = [-0.55, -0.62, 0.56];
+  var modLuce = Math.sqrt(luce[0] * luce[0] + luce[1] * luce[1] + luce[2] * luce[2]);
+  var lx = luce[0] / modLuce, ly = luce[1] / modLuce, lz = luce[2] / modLuce;
+
+  // --- Stato di rotazione e interazione ---
+  var yaw = 0.6, pitchUtente = 0.08;
+  var velYaw = VELOCITA_ROT, velPitch = 0;
+  var premuto = false, puntatoreId = -1;
+  var mouseX = 0, mouseY = 0, ultimoX = 0, ultimoY = 0;
+  var baglioreHold = 0;
+  var tempo = 0, ultimoIstante = performance.now();
+
+  function coloreCss(rgb, alpha) {
+    return 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + alpha + ')';
+  }
+
+  // --- Interazione con mouse e touch tramite Pointer Events ---
+  canvas.addEventListener('pointerdown', function (e) {
+    premuto = true;
+    puntatoreId = e.pointerId;
+    var rect = canvas.getBoundingClientRect();
+    mouseX = (e.clientX - rect.left) * (LARGHEZZA / rect.width);
+    mouseY = (e.clientY - rect.top) * (ALTEZZA / rect.height);
+    ultimoX = mouseX; ultimoY = mouseY;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!premuto || e.pointerId !== puntatoreId) { return; }
+    var rect = canvas.getBoundingClientRect();
+    mouseX = (e.clientX - rect.left) * (LARGHEZZA / rect.width);
+    mouseY = (e.clientY - rect.top) * (ALTEZZA / rect.height);
+    var dx = mouseX - ultimoX, dy = mouseY - ultimoY;
+    ultimoX = mouseX; ultimoY = mouseY;
+    // Trascinamento: ruota la sfera e alimenta l'inerzia.
+    yaw += dx * 0.0052;
+    pitchUtente += dy * 0.0038;
+    if (pitchUtente > 0.65) { pitchUtente = 0.65; }
+    if (pitchUtente < -0.65) { pitchUtente = -0.65; }
+    velYaw = velYaw * 0.65 + (dx * 0.0052 * 60) * 0.35;
+    velPitch = velPitch * 0.65 + (dy * 0.0038 * 60) * 0.35;
+  });
+  function rilascia(e) {
+    if (e.pointerId !== puntatoreId) { return; }
+    premuto = false;
+    puntatoreId = -1;
+    // Inerzia dolce al rilascio: limita la velocita residua.
+    if (velYaw > 2.2) { velYaw = 2.2; }
+    if (velYaw < -2.2) { velYaw = -2.2; }
+    if (velPitch > 1.2) { velPitch = 1.2; }
+    if (velPitch < -1.2) { velPitch = -1.2; }
+  }
+  canvas.addEventListener('pointerup', rilascia);
+  canvas.addEventListener('pointercancel', rilascia);
+
+  // --- Ciclo di animazione ---
+  function frame(ora) {
+    var dtGrezzo = (ora - ultimoIstante) / 1000;
+    ultimoIstante = ora;
+    var dt = Math.min(Math.max(dtGrezzo, 0.001), 0.05);
+    tempo += dt;
+
+    // Inerzia: la velocita torna dolcemente a quella di base quando non si trascina.
+    if (!premuto) {
+      var k = 1 - Math.exp(-dt * 1.4);
+      velYaw += (VELOCITA_ROT - velYaw) * k;
+      velPitch += (0 - velPitch) * (1 - Math.exp(-dt * 2.2));
+      pitchUtente += velPitch * dt;
+      if (pitchUtente > 0.65) { pitchUtente = 0.65; }
+      if (pitchUtente < -0.65) { pitchUtente = -0.65; }
+    } else {
+      velYaw += (VELOCITA_ROT - velYaw) * (1 - Math.exp(-dt * 0.6));
+    }
+    yaw += velYaw * dt;
+    // Oscillazione continua del pitch attorno al valore scelto dall'utente.
+    var pitch = pitchUtente + Math.sin(tempo * 0.18) * 0.13 + Math.sin(tempo * 0.07 + 1.3) * 0.05;
+    var cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+    var cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+
+    // Il bagliore centrale caldo cresce finche si tiene premuto.
+    if (premuto) {
+      baglioreHold += (1 - baglioreHold) * (1 - Math.exp(-dt * 3.2));
+    } else {
+      baglioreHold += (0 - baglioreHold) * (1 - Math.exp(-dt * 2.2));
+    }
+    if (baglioreHold < 0.001) { baglioreHold = 0; }
+
+    sctx.setTransform(1, 0, 0, 1, 0, 0);
+    sctx.clearRect(0, 0, LARGHEZZA, ALTEZZA);
+    sctx.fillStyle = SFONDO;
+    sctx.fillRect(0, 0, LARGHEZZA, ALTEZZA);
+
+    // Alone radiale dietro la sfera.
+    var aloneR = RAGGIO * 1.75;
+    var alone = sctx.createRadialGradient(cx, cy, RAGGIO * 0.2, cx, cy, aloneR);
+    alone.addColorStop(0, 'rgba(147,197,253,0.16)');
+    alone.addColorStop(0.45, 'rgba(96,140,240,0.07)');
+    alone.addColorStop(1, 'rgba(5,7,15,0)');
+    sctx.fillStyle = alone;
+    sctx.fillRect(cx - aloneR, cy - aloneR, aloneR * 2, aloneR * 2);
+
+    var tFlusso = tempo * 0.35 * VELOCITA_FLUSSO;
+    for (var j = 0; j < particelle.length; j++) {
+      var p = particelle[j];
+      var bx = p.base[0], by = p.base[1], bz = p.base[2];
+      // Molla elastica: ritorno in circa 1 secondo con un leggero rimbalzo (k=55, c=5.5).
+      if (!premuto) {
+        var acc = -55 * p.spost - 5.5 * p.velSpost;
+        p.velSpost += acc * dt;
+        p.spost += p.velSpost * dt;
+        if (Math.abs(p.spost) < 0.02 && Math.abs(p.velSpost) < 0.05) { p.spost = 0; p.velSpost = 0; }
+      }
+      p.bagliore *= Math.exp(-dt * 2.6);
+      if (p.bagliore < 0.01) { p.bagliore = 0; }
+
+      // Flusso tangenziale sinusoidale: correnti che scorrono sulla sfera.
+      var tx = -bz, ty = 0, tz = bx;
+      var tl = Math.sqrt(tx * tx + tz * tz);
+      if (tl < 0.001) { tx = 1; ty = 0; tz = 0; tl = 1; } else { tx /= tl; tz /= tl; }
+      // Seconda tangente come prodotto vettoriale tra direzione e prima tangente.
+      var ux = by * tz - bz * ty;
+      var uy = bz * tx - bx * tz;
+      var uz = bx * ty - by * tx;
+      var fp = p.faseFlusso;
+      var f1 = Math.sin(by * 3.1 + tFlusso + fp) * 0.045 + Math.sin(bz * 2.2 - tFlusso * 0.7 + fp * 1.7) * 0.03;
+      var f2 = Math.cos(bx * 2.7 - tFlusso * 0.8 + fp) * 0.045 + Math.sin(by * 4.3 + tFlusso * 0.5) * 0.025;
+      var qx = bx + tx * f1 + ux * f2;
+      var qy = by + ty * f1 + uy * f2;
+      var qz = bz + tz * f1 + uz * f2;
+      var ql = Math.sqrt(qx * qx + qy * qy + qz * qz) || 1;
+      qx /= ql; qy /= ql; qz /= ql;
+
+      // Rotazione attorno a Y e poi attorno a X (pitch).
+      var rx = qx * cosY + qz * sinY;
+      var rz1 = -qx * sinY + qz * cosY;
+      var ry = qy * cosP - rz1 * sinP;
+      var rz = qy * sinP + rz1 * cosP;
+
+      // Pulsazione radiale + sollevamento da disturbo.
+      var pulso = Math.sin(tempo * p.velPulso + p.fase) * p.ampRadiale;
+      var rad = RAGGIO + pulso + p.spost;
+      var persp = 1 / (1 - rz * 0.26);
+      var sx = cx + rx * rad * persp;
+      var sy = cy + ry * rad * persp;
+
+      // Disturbo vicino al puntatore mentre si tiene premuto: solleva e fa brillare i granelli.
+      if (premuto) {
+        var ddx = sx - mouseX, ddy = sy - mouseY;
+        var d2 = ddx * ddx + ddy * ddy;
+        if (d2 < RAGGIO_DISTURBO * RAGGIO_DISTURBO) {
+          var d = Math.sqrt(d2) || 0.001;
+          var inf = 1 - d / RAGGIO_DISTURBO;
+          var obiettivo = inf * inf * 26;
+          if (obiettivo > p.spost) {
+            p.spost += (obiettivo - p.spost) * Math.min(1, dt * 14);
+            p.velSpost = 0;
+          }
+          if (inf > p.bagliore) { p.bagliore = inf; }
+          var spinta = inf * inf * 20;
+          sx += (ddx / d) * spinta;
+          sy += (ddy / d) * spinta;
+        }
+      }
+
+      // Illuminazione direzionale + profondita, con scintillio (twinkle).
+      var diffusa = Math.max(0, rx * lx + ry * ly + rz * lz);
+      var luceQ = 0.22 + 0.78 * diffusa;
+      var fronte = (rz + 1) / 2;
+      var alpha = luceQ * (0.18 + 0.82 * fronte) * (0.55 + 0.45 * Math.sin(p.fase * 3.7) * 0.5 + 0.45);
+      alpha *= 0.72 + 0.28 * Math.sin(tempo * 0.9 + p.fase * 2.1);
+      if (p.bagliore > 0) { alpha = Math.min(1, alpha + p.bagliore * 0.65); }
+      var distN = Math.min(1, Math.sqrt((sx - cx) * (sx - cx) + (sy - cy) * (sy - cy)) / RAGGIO);
+      if (baglioreHold > 0) {
+        alpha = Math.min(1, alpha * (1 + baglioreHold * INTENSITA_HOLD * 0.9 * (1 - distN)));
+      }
+      if (alpha < 0.03) { continue; }
+
+      // Granelli circolari, piu grandi davanti e quando brillano.
+      var dim = p.dim * (0.72 + 0.55 * fronte) * persp * (p.bagliore > 0.05 ? 1.5 : 1);
+      if (dim < 0.7) { dim = 0.7; }
+      if (baglioreHold > 0) { dim *= 1 + baglioreHold * 0.25 * (1 - distN); }
+
+      if (p.bagliore > 0.12) {
+        sctx.globalAlpha = Math.min(1, alpha);
+        sctx.fillStyle = '#FFFFFF';
+        sctx.beginPath();
+        sctx.arc(sx, sy, dim / 2, 0, Math.PI * 2);
+        sctx.fill();
+        sctx.globalAlpha = p.bagliore * 0.35;
+        sctx.fillStyle = coloreCss(COLORI[1], 1);
+        var hs = dim * 2.4;
+        sctx.beginPath();
+        sctx.arc(sx, sy, hs / 2, 0, Math.PI * 2);
+        sctx.fill();
+      } else {
+        sctx.globalAlpha = alpha;
+        sctx.fillStyle = coloreCss(COLORI[p.colore], 1);
+        sctx.beginPath();
+        sctx.arc(sx, sy, dim / 2, 0, Math.PI * 2);
+        sctx.fill();
+      }
+    }
+    sctx.globalAlpha = 1;
+
+    // Bagliore centrale caldo che cresce tenendo premuto.
+    if (baglioreHold > 0.01) {
+      var glowR = RAGGIO * 1.35;
+      var A = INTENSITA_HOLD * 0.55 * baglioreHold;
+      var holdGrad = sctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
+      holdGrad.addColorStop(0, 'rgba(255,248,231,' + A + ')');
+      holdGrad.addColorStop(0.35, 'rgba(255,244,214,' + (A * 0.55) + ')');
+      holdGrad.addColorStop(0.7, 'rgba(' + COLORE_BAGLIORE[0] + ',' + COLORE_BAGLIORE[1] + ',' + COLORE_BAGLIORE[2] + ',' + (A * 0.28) + ')');
+      holdGrad.addColorStop(1, 'rgba(0,0,0,0)');
+      sctx.globalCompositeOperation = 'lighter';
+      sctx.fillStyle = holdGrad;
+      sctx.fillRect(cx - glowR, cy - glowR, glowR * 2, glowR * 2);
+      sctx.globalCompositeOperation = 'source-over';
+      sctx.globalAlpha = 1;
+    }
+
+    // Dithering Bayer 8x8 su tutto il frame: quantizzazione a 4 livelli per canale.
+    var img = sctx.getImageData(0, 0, LARGHEZZA, ALTEZZA);
+    var dati = img.data;
+    for (var y = 0; y < ALTEZZA; y++) {
+      var riga = BAYER8[y % 8];
+      for (var x = 0; x < LARGHEZZA; x++) {
+        var soglia = (riga[x % 8] + 0.5) / 64;
+        var pos = (y * LARGHEZZA + x) * 4;
+        for (var c = 0; c < 3; c++) {
+          var q = Math.floor((dati[pos + c] / 255) * 3 + soglia);
+          if (q < 0) { q = 0; } else if (q > 3) { q = 3; }
+          dati[pos + c] = q * 85;
+        }
+      }
+    }
+    actx.putImageData(img, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(appoggio, 0, 0);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
